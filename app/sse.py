@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import orjson
 
 from .broadcaster import Broadcaster
+
+_log = logging.getLogger(__name__)
 
 
 def parse_last_id(last_event_id: str | None, cursor: int) -> int:
@@ -60,14 +63,25 @@ async def stream_events(
     `is_disconnected` promptly when clients hang up.
     """
     q = broadcaster.subscribe(bucket)
+    _log.info(
+        "sse_connect",
+        extra={
+            "bucket": bucket,
+            "cursor": last_id,
+            "subscribers": broadcaster.subscriber_count(bucket),
+        },
+    )
+    events_sent = 0
     try:
         if broadcaster.has_gap(bucket, last_id):
             yield sse_stale(broadcaster.current_cursor(bucket), bucket)
+            events_sent += 1
             return
 
         replayed_ids: set[int] = set()
         for evt in broadcaster.replay_since(bucket, last_id):
             yield sse_payload(evt.event, evt.id, evt.data)
+            events_sent += 1
             replayed_ids.add(evt.id)
 
         while True:
@@ -80,5 +94,10 @@ async def stream_events(
             if evt.id in replayed_ids:
                 continue
             yield sse_payload(evt.event, evt.id, evt.data)
+            events_sent += 1
     finally:
         broadcaster.unsubscribe(bucket, q)
+        _log.info(
+            "sse_disconnect",
+            extra={"bucket": bucket, "events_sent": events_sent},
+        )

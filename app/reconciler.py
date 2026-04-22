@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,8 @@ from .broadcaster import Broadcaster
 from .bucket_state import BucketState
 from .dedup import dedup
 from .state_paths import arbitrage_db_path
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -56,6 +59,24 @@ async def run_once(
             total_del += 1
 
     reconcile_ms = (time.perf_counter() - t0) * 1000.0
+
+    _log.info(
+        "reconcile_complete",
+        extra={
+            "scanner_run_id": scanner_run_id,
+            "rows_read": len(rows),
+            "deduped": len(deduped),
+            "total_upserts": total_up,
+            "total_deletes": total_del,
+            "reconcile_ms": round(reconcile_ms, 3),
+            "per_bucket": {
+                d.bucket: {"upserts": len(d.upserts), "deletes": len(d.deletes)}
+                for d in deltas
+                if not d.is_empty()
+            },
+        },
+    )
+
     return ReconcileResult(
         reconcile_ms=reconcile_ms,
         scanner_run_id=scanner_run_id,

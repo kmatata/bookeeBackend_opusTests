@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import zlib
 from pathlib import Path
@@ -12,6 +13,7 @@ _SQLITE_MAGIC = b"SQLite format 3\x00"
 _GZIP_MAGIC = b"\x1f\x8b"
 
 _lock = asyncio.Lock()
+_log = logging.getLogger(__name__)
 
 
 def get_ingest_lock() -> asyncio.Lock:
@@ -43,6 +45,10 @@ async def stream_to_temp(
         nonlocal total
         total += len(data)
         if total > max_bytes:
+            _log.warning(
+                "body_too_large",
+                extra={"bytes_received": total, "limit": max_bytes},
+            )
             raise HTTPException(
                 status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail=f"body exceeds {max_bytes} bytes",

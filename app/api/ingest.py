@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
@@ -13,6 +14,7 @@ from ..reconciler import run_once
 from ..state_paths import arbitrage_db_incoming_path, arbitrage_db_path
 
 router = APIRouter()
+_log = logging.getLogger(__name__)
 
 
 def _fmt(ms: float | None) -> str:
@@ -43,6 +45,10 @@ async def ingest_arbitrage(
         if x_scanner_run_id is not None:
             last = getattr(request.app.state, "last_scanner_run_id", 0)
             if x_scanner_run_id <= last:
+                _log.warning(
+                    "push_rejected_duplicate",
+                    extra={"run_id": x_scanner_run_id, "last_applied": last},
+                )
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
@@ -89,6 +95,18 @@ async def ingest_arbitrage(
 
         if x_scanner_run_id is not None:
             request.app.state.last_scanner_run_id = x_scanner_run_id
+
+        _log.info(
+            "push_received",
+            extra={
+                "run_id": x_scanner_run_id,
+                "bytes": bytes_written,
+                "upload_ms": round(upload_ms, 3),
+                "reconcile_ms": round(rec.reconcile_ms, 3),
+                "e2e_ms": round(e2e_ms, 3),
+                "bucket_counts": request.app.state.bucket_state.counts(),
+            },
+        )
 
     headers = {
         "X-Upload-Ms": _fmt(upload_ms),
