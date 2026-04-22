@@ -1,0 +1,11 @@
+[project]
+name = "bookee-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: opt-in tests that require a live filesystem or network",
+]
