@@ -9,6 +9,9 @@ services:
       - "8000:8000"
     volumes:
       - bookee_state:/state
+      # Client web build: `npm run build` in bookeeClient_opusTests writes
+      # dist/web/ here.  Mount is read-only; backend rebuild not required.
+      - ../bookeeClient_opusTests/dist/web:/client:ro
     networks:
       - chrome-net
     # Reuse the Dockerfile HEALTHCHECK so the ETL service waits until
