@@ -18,6 +18,7 @@ Docker volume**. The app reads and writes:
 | `/state/arbitrage.db.incoming` | Temp target during upload (renamed atomically) |
 | `/state/ops.db` | Receive timings + EMA state (persists across restarts) |
 | `/state/snapshots/` | Cached per-bucket snapshot files |
+| `/state/logs.db` | Structured JSON log records (ts, level, event, data) |
 
 Running `python main.py` outside Docker writes to `/state` on the host
 filesystem, which requires root or a pre-created writable `/state` dir.
@@ -181,6 +182,27 @@ sqlite3 low.db 'SELECT COUNT(*) FROM arb_opportunities;'
 # SSE stream (Ctrl-C to stop)
 curl -N http://localhost:8000/stream/low
 ```
+
+## Retrieving structured logs
+
+Every log line is written to `/state/logs.db` inside the container.
+Copy it to the host at any time (container can keep running):
+
+```bash
+docker cp bookee-backend:/state/logs.db ./logs.db
+
+# Query recent errors
+sqlite3 logs.db "SELECT ts, event, data FROM logs WHERE level IN ('ERROR','WARNING') ORDER BY ts DESC LIMIT 50;"
+
+# All push events
+sqlite3 logs.db "SELECT ts, data FROM logs WHERE event='push_received' ORDER BY ts DESC LIMIT 20;"
+
+# SSE connection history
+sqlite3 logs.db "SELECT ts, event, data FROM logs WHERE event IN ('sse_connect','sse_disconnect') ORDER BY ts DESC LIMIT 40;"
+```
+
+The `data` column holds a JSON object with all event-specific fields
+(run_id, bytes, bucket_counts, etc.).
 
 ## Key design decisions
 
