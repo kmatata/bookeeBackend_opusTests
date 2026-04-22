@@ -34,28 +34,120 @@ python -m pytest tests/ -v
 All tests are self-contained; fixtures build fresh SQLite DBs in `tmp_path`
 and clear the settings cache between runs.
 
-## Running the app (Docker)
+## Running the full stack
+
+`docker-compose.yml` lives in this directory and references the ETL repo at
+`../bookeeETL_opusTests`. Both containers join `chrome-net` (the pre-existing
+Docker bridge that the `chrome_client` container lives on) so the ETL can
+reach the Chrome CDP endpoint and the backend by name simultaneously.
+
+### Mode A — Docker Compose (recommended for integration testing)
+
+```bash
+cd ~/Documents/bookeeBackend_opusTests
+
+# Build both images and start
+docker compose up --build
+
+# Follow logs for one service
+docker compose logs -f bookee-backend
+docker compose logs -f bookee-etl
+
+# Probe the backend while compose is running
+curl -s http://localhost:8000/health  | jq
+curl -s http://localhost:8000/metrics | jq .hypothesis_5s
+curl -s http://localhost:8000/buckets | jq
+
+# Tear down (volumes are preserved)
+docker compose down
+```
+
+The ETL service waits for the backend's `/health` to return 200 before
+starting (`depends_on: condition: service_healthy`), so the shipper never
+fires before the backend is ready to accept pushes.
+
+### Mode B — ETL local + backend in Docker (recommended during ETL development)
+
+Start the backend container standalone on `chrome-net`:
+
+```bash
+docker build -t bookee-backend ~/Documents/bookeeBackend_opusTests
+docker run -d \
+  --name bookee-backend \
+  --network chrome-net \
+  -p 8000:8000 \
+  -v bookee_state:/state \
+  bookee-backend
+```
+
+Then run the ETL locally pointing at it:
+
+```bash
+cd ~/Documents/bookeeETL_opusTests
+export BACKEND_URL=http://localhost:8000
+export INGEST_TOKEN=dev-secret
+python orchestrator.py
+```
+
+The ETL reaches the container via the published port on the host. Changes to
+ETL Python code take effect immediately on the next `python orchestrator.py`
+restart — no rebuild needed.
+
+To stop the backend container when done:
+```bash
+docker rm -f bookee-backend
+```
+
+### Mode C — fully local (no Docker)
+
+Override `STATE_DIR` so the app writes to a local directory instead of `/state`:
+
+```bash
+# terminal 1 — backend
+cd ~/Documents/bookeeBackend_opusTests
+mkdir -p ./state/snapshots
+export STATE_DIR=./state
+python main.py
+
+# terminal 2 — ETL
+cd ~/Documents/bookeeETL_opusTests
+export BACKEND_URL=http://localhost:8000
+export INGEST_TOKEN=dev-secret
+python orchestrator.py
+```
+
+### Verifying end-to-end
+
+After the first ETL scanner pass (~10 s for live, ~10 min for upcoming):
+
+```bash
+# samples increments with each push
+curl -s http://localhost:8000/metrics | jq .samples
+
+# inter-arrival EMA should converge toward 5000 ms after a few minutes
+curl -s http://localhost:8000/metrics | jq .hypothesis_5s
+
+# non-zero counts confirm reconcile is running
+curl -s http://localhost:8000/buckets | jq
+```
+
+## Running the app (Docker, standalone)
 
 ```bash
 # build
 docker build -t bookee-backend .
 
-# run (state volume persists ops.db + last received arbitrage.db)
-docker run --rm -p 8000:8000 \
+# run on chrome-net so ETL containers can reach it by name
+docker run -d \
+  --name bookee-backend \
+  --network chrome-net \
+  -p 8000:8000 \
   -v bookee_state:/state \
-  -e INGEST_TOKEN=dev-secret \
-  bookee-backend
-
-# or with full env override
-docker run --rm -p 8000:8000 \
-  -v bookee_state:/state \
-  --env-file .env \
   bookee-backend
 ```
 
-The `.env` file is also baked into the image at build time (see `Dockerfile`),
-so variables in `.env` are available without `--env-file` when the file is
-present at build time. Override with `-e` flags at runtime.
+The `.env` file is baked into the image at build time (see `Dockerfile`).
+Override individual variables with `-e KEY=value` at runtime.
 
 ## Simulating an ETL push (curl)
 
