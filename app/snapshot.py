@@ -22,15 +22,22 @@ class SnapshotArtifact:
     built_at: float  # monotonic timestamp
 
 
+def _disk_path(bucket: str, cursor: int) -> Path:
+    return snapshots_dir() / f"{bucket}-{cursor}.db.gz"
+
+
 class SnapshotCache:
     """Per-bucket TTL cache around `_build_snapshot`.
 
-    Rationale: clients boot by hitting `/snapshot/{bucket}` before
-    opening the SSE stream, so a crowd of fresh subscribers would
-    otherwise VACUUM INTO N times in parallel for the same cursor.
-    Cache serves identical bytes while `cursor` is unchanged and the
-    TTL hasn't expired; per-bucket `asyncio.Lock` coalesces concurrent
-    misses so only one build runs at a time.
+    Memory layer: serves identical bytes while `cursor` is unchanged
+    and the TTL hasn't expired — no disk read on hot path.
+
+    Disk layer: on a memory miss the cache checks for a previously
+    written `snapshots/{bucket}-{cursor}.db.gz` before running a full
+    VACUUM INTO. This survives process restarts so a restarted backend
+    serving many cold clients doesn't rebuild from scratch.
+
+    Per-bucket `asyncio.Lock` coalesces concurrent misses to one build.
     """
 
     def __init__(self, ttl_seconds: float) -> None:
@@ -45,12 +52,12 @@ class SnapshotCache:
         cursor: int,
         bucket_state: BucketState,
     ) -> SnapshotArtifact:
-        hit = self._lookup_fresh(bucket, cursor)
+        hit = self._lookup_mem(bucket, cursor)
         if hit is not None:
             return hit
         lock = self._locks.setdefault(bucket, asyncio.Lock())
         async with lock:
-            hit = self._lookup_fresh(bucket, cursor)
+            hit = self._lookup_mem(bucket, cursor)
             if hit is not None:
                 return hit
             rows = bucket_state.snapshot(bucket)
@@ -60,7 +67,7 @@ class SnapshotCache:
             self._cache[bucket] = artifact
             return artifact
 
-    def _lookup_fresh(self, bucket: str, cursor: int) -> SnapshotArtifact | None:
+    def _lookup_mem(self, bucket: str, cursor: int) -> SnapshotArtifact | None:
         hit = self._cache.get(bucket)
         if hit is None:
             return None
@@ -76,21 +83,31 @@ def _build_snapshot(
 ) -> SnapshotArtifact:
     """Produce a gzipped, bucket-filtered SQLite file.
 
-    Path preference: when `/state/arbitrage.db` exists, replicate its
-    `sqlite_master` DDL (picks up any ETL-side schema extensions we
-    haven't mirrored yet) and copy the bucket's opportunity/leg rows
-    via ATTACH. When it doesn't, fall back to the bundled schema —
-    the response is still a valid, openable SQLite file with zero
-    rows, which is exactly what a boot-time client expects when the
-    backend hasn't yet received a push.
+    Disk-cache check: if `snapshots/{bucket}-{cursor}.db.gz` already
+    exists from a previous build (e.g. before a restart), load it
+    directly — no VACUUM INTO needed. Stale files (different cursor)
+    are pruned after a successful build.
+
+    Source preference: when `/state/arbitrage.db` exists, replicate its
+    `sqlite_master` DDL (picks up any ETL-side schema extensions) and
+    copy the bucket's rows via ATTACH. Falls back to the bundled schema
+    when no push has arrived yet — still a valid, openable SQLite file.
     """
     ids = [int(r["opportunity_id"]) for r in rows]
-    source = arbitrage_db_path()
+    disk = _disk_path(bucket, cursor)
 
+    # Disk hit — reuse bytes from a prior build.
+    if disk.exists():
+        body = disk.read_bytes()
+        return SnapshotArtifact(
+            bucket=bucket, cursor=cursor, body=body,
+            row_count=len(ids), built_at=time.monotonic(),
+        )
+
+    source = arbitrage_db_path()
     work = snapshots_dir()
     work.mkdir(parents=True, exist_ok=True)
-    # `monotonic_ns` ensures unique filenames even if two builds for
-    # the same bucket land in the same microsecond.
+
     nonce = f"{os.getpid()}-{time.monotonic_ns()}"
     build_path = work / f".build-{bucket}-{nonce}.db"
     out_path = work / f".vacuum-{bucket}-{nonce}.db"
@@ -98,7 +115,6 @@ def _build_snapshot(
     out_path.unlink(missing_ok=True)
 
     try:
-        # `uri=True` lets us ATTACH the source with `?mode=ro` below.
         conn = sqlite3.connect(f"file:{build_path}", uri=True)
         try:
             if source.exists():
@@ -108,9 +124,6 @@ def _build_snapshot(
             else:
                 conn.executescript(ARBITRAGE_SCHEMA_SQL)
             conn.commit()
-            # `VACUUM INTO` produces a single-file, WAL-free, page-
-            # aligned DB — perfect for clients to deserialize directly.
-            # The target path is not parameterisable, so SQL-quote it.
             quoted = str(out_path).replace("'", "''")
             conn.execute(f"VACUUM INTO '{quoted}'")
         finally:
@@ -120,9 +133,19 @@ def _build_snapshot(
         build_path.unlink(missing_ok=True)
         out_path.unlink(missing_ok=True)
 
-    # Level 3 trades a few percent of compression for meaningful
-    # encode-time savings on these small DBs; body is served gzipped.
     body = gzip.compress(raw, compresslevel=3)
+
+    # Write to disk atomically so a concurrent reader never sees a
+    # partial file.  Use a temp name then os.replace().
+    tmp = work / f".gz-{bucket}-{nonce}"
+    tmp.write_bytes(body)
+    os.replace(tmp, disk)
+
+    # Prune stale snapshots for this bucket (different cursor).
+    for stale in work.glob(f"{bucket}-*.db.gz"):
+        if stale != disk:
+            stale.unlink(missing_ok=True)
+
     return SnapshotArtifact(
         bucket=bucket, cursor=cursor, body=body,
         row_count=len(ids), built_at=time.monotonic(),
@@ -130,11 +153,6 @@ def _build_snapshot(
 
 
 def _replicate_schema(conn: sqlite3.Connection, source: Path) -> None:
-    """Copy every DDL statement from the source DB's `sqlite_master`.
-
-    Ordered tables → indexes → views so view bodies can reference
-    their base tables without forward declarations.
-    """
     src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     try:
         ddls = src.execute(
@@ -155,9 +173,6 @@ def _replicate_schema(conn: sqlite3.Connection, source: Path) -> None:
 def _copy_rows(
     conn: sqlite3.Connection, source: Path, ids: list[int],
 ) -> None:
-    """Bulk-copy the bucket's opportunity + leg rows and the full
-    `arb_runs` table (small, keeps FK-consistent for clients that
-    enable `PRAGMA foreign_keys=ON`)."""
     placeholders = ",".join("?" * len(ids))
     conn.execute("ATTACH DATABASE ? AS src", (f"file:{source}?mode=ro",))
     try:
@@ -173,8 +188,5 @@ def _copy_rows(
             ids,
         )
     finally:
-        # python sqlite3 opens an implicit transaction on the first
-        # write, holding SHARED/RESERVED locks on `src` until commit.
-        # DETACH refuses while those locks are live — commit first.
         conn.commit()
         conn.execute("DETACH DATABASE src")
