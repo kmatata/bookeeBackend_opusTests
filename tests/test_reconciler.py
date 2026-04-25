@@ -23,8 +23,7 @@ def _active_opp(
     start_offset_hours: int = 48,
     last_seen_offset_seconds: int = -1,
 ) -> dict:
-    """Returns an opp that the view's status CASE will classify ACTIVE:
-    start_time >> now (no EXPIRED), last_seen_at ~= now (no STALE)."""
+    """Returns an opp classified ACTIVE: last_seen_at is recent (no STALE)."""
     now = dt.datetime.now(dt.UTC)
     start = (now + dt.timedelta(hours=start_offset_hours)).isoformat()
     last_seen = (now + dt.timedelta(seconds=last_seen_offset_seconds)).isoformat()
@@ -125,12 +124,12 @@ async def test_run_once_bucket_migration_deletes_and_upserts(bs, bc):
     assert bs.counts()["high"] == 1
 
 
-async def test_run_once_skips_expired_rows(bs, bc):
-    """start_time in the past → EXPIRED → excluded by the view filter."""
+async def test_run_once_skips_stale_rows(bs, bc):
+    """last_seen_at past the upcoming stale window → STALE → excluded by the view filter."""
     path = arbitrage_db_path()
     _fresh_state(path,
         opportunities=[_active_opp(opp_id=1, group_id=1, bps=400,
-                                   start_offset_hours=-4)],  # 4h in past
+                                   last_seen_offset_seconds=-700)],  # >600s stale window
         legs=[_leg(1, 0, "a"), _leg(1, 1, "b")],
     )
     res = await run_once(scanner_run_id=1, bucket_state=bs, broadcaster=bc)

@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     snapshot_cache_seconds: int = 2
 
     # copied from bookeeETL_opusTests/arbitrage/schema.py — keep in sync
-    stale_seconds_live: int = 45
+    stale_seconds_live: int = 10
     stale_seconds_upcoming: int = 600
 
     schema_version: int = 1
