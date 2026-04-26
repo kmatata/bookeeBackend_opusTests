@@ -1,0 +1,67 @@
+services:
+
+  bookee-backend:
+    build:
+      context: .
+    image: bookee-backend
+    container_name: bookee-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - bookee_state:/state
+      # Client web build: `npm run build` in bookeeClient_opusTests writes
+      # dist/web/ here.  Mount is read-only; backend rebuild not required.
+      - ../bookeeClient_opusTests/dist/web:/client:ro
+    networks:
+      - chrome-net
+    # Reuse the Dockerfile HEALTHCHECK so the ETL service waits until
+    # /health returns 200 before the shipper starts firing.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status == 200 else 1)
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  bookee-etl:
+    build:
+      context: ../bookeeETL_opusTests
+    image: bookee-etl
+    container_name: bookee-etl
+    depends_on:
+      bookee-backend:
+        condition: service_healthy
+    environment:
+      # Compose resolves ${INGEST_TOKEN} from the .env file in this directory.
+      BACKEND_URL: http://bookee-backend:8000
+      INGEST_TOKEN: ${INGEST_TOKEN:-dev-secret}
+    volumes:
+      # Persist arbitrage.db and worker.db across restarts.
+      - etl_repo:/app/repo
+      # sport_pesa's BrowserExtractor calls docker.from_env() to locate the
+      # chrome_client container — the host socket must be visible inside.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - chrome-net
+    restart: unless-stopped
+
+volumes:
+  # Reuse the volume that was created before compose was introduced so
+  # existing ops.db EMA history and arbitrage.db state are preserved.
+  bookee_state:
+    external: true
+  etl_repo:
+
+networks:
+  # chrome_client lives on this network; ETL must share it to reach the
+  # Chrome container by name for sport_pesa CDP. Backend joins it so
+  # "bookee-backend" resolves inside the ETL container.
+  chrome-net:
+    external: true
