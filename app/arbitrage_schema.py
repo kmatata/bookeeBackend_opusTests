@@ -93,8 +93,10 @@ SELECT
     o.last_seen_at,
     CASE
         WHEN source_type = 'live'
-             AND MIN(julianday(oldest_odd_updated_at), julianday(last_seen_at))
-                     < julianday('now') - 0.00011574074074074075
+             AND datetime(start_time, '-3 hours') < datetime('now', '-150 minutes')
+            THEN 'EXPIRED'
+        WHEN source_type = 'live'
+             AND julianday(oldest_odd_updated_at) < julianday('now') - 0.001388888888888889
             THEN 'STALE'
         WHEN source_type != 'live'
              AND julianday(last_seen_at) < julianday('now') - 0.006944444444444444
