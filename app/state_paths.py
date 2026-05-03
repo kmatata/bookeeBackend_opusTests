@@ -17,6 +17,14 @@ def arbitrage_db_incoming_path() -> Path:
     return state_dir() / "arbitrage.db.incoming"
 
 
+def matches_db_path() -> Path:
+    return state_dir() / "matches.db"
+
+
+def matches_db_incoming_path() -> Path:
+    return state_dir() / "matches.db.incoming"
+
+
 def ops_db_path() -> Path:
     return state_dir() / "ops.db"
 

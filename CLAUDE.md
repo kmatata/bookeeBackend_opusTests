@@ -2,10 +2,19 @@
 
 ## What this is
 
-FastAPI backend that receives `arbitrage.db` SQLite pushes from the ETL
-container (`bookeeETL_opusTests`), deduplicates and bucket-partitions the
-opportunities, then fans out per-bucket SSE deltas to browser clients.
-Clients boot via `GET /snapshot/{bucket}` then follow `GET /stream/{bucket}`.
+FastAPI backend that receives data from the ETL (`bookeeETL_opusTests`).
+
+**Default mode (client-side arbitrage):** the ETL pushes `matches.db`
+(containing materialised matched odds) to `PUT /ingest/matches`.  The
+backend stores the file and fans out ``refresh`` events on
+`GET /stream/matches` so clients know to re-fetch
+`GET /snapshot/matches`.  Arbitrage calculation runs in the browser.
+
+**Legacy mode (`--legacy-arb` on ETL):** the ETL pushes `arbitrage.db`
+(containing pre-computed opportunities) to `PUT /ingest/arbitrage`.  The
+backend deduplicates, bucket-partitions, and fans out per-bucket SSE
+deltas.  Clients boot via `GET /snapshot/{bucket}` then follow
+`GET /stream/{bucket}`.
 
 ## Why it only runs inside Docker
 
@@ -14,8 +23,10 @@ Docker volume**. The app reads and writes:
 
 | Path | Purpose |
 |------|---------|
-| `/state/arbitrage.db` | Latest SQLite pushed by ETL |
-| `/state/arbitrage.db.incoming` | Temp target during upload (renamed atomically) |
+| `/state/matches.db` | Latest matched-odds SQLite pushed by ETL (default mode) |
+| `/state/matches.db.incoming` | Temp target during matches upload |
+| `/state/arbitrage.db` | Latest arbitrage SQLite pushed by ETL (legacy mode) |
+| `/state/arbitrage.db.incoming` | Temp target during arbitrage upload |
 | `/state/ops.db` | Receive timings + EMA state (persists across restarts) |
 | `/state/snapshots/` | Cached per-bucket snapshot files |
 | `/state/logs.db` | Structured JSON log records (ts, level, event, data) |
@@ -153,7 +164,14 @@ Override individual variables with `-e KEY=value` at runtime.
 ## Simulating an ETL push (curl)
 
 ```bash
-# push a real arbitrage.db from the ETL repo
+# push matches.db (default / client-side arb mode)
+curl -X PUT http://localhost:8000/ingest/matches \
+  -H "Content-Type: application/vnd.sqlite3" \
+  -H "X-Ingest-Token: dev-secret" \
+  --data-binary @~/Documents/bookeeETL_opusTests/repo/matches.db \
+  -D -
+
+# push arbitrage.db (legacy mode)
 curl -X PUT http://localhost:8000/ingest/arbitrage \
   -H "Content-Type: application/vnd.sqlite3" \
   -H "X-Ingest-Token: dev-secret" \
@@ -172,14 +190,21 @@ curl -s http://localhost:8000/meta     | jq
 curl -s http://localhost:8000/buckets  | jq
 curl -s http://localhost:8000/metrics  | jq
 
-# JSON contents of a bucket (debug)
+# JSON contents of a bucket (debug, legacy only)
 curl -s http://localhost:8000/arbs/low | jq '.[0]'
 
-# SQLite snapshot (decompress and open)
+# SQLite snapshot — matches (client-side arb)
+curl -so matches.db --compressed http://localhost:8000/snapshot/matches
+sqlite3 matches.db 'SELECT COUNT(*) FROM matched_three_way_odds;'
+
+# SSE stream — matches refresh events (client-side arb)
+curl -N http://localhost:8000/stream/matches
+
+# SQLite snapshot — per-bucket (legacy)
 curl -so low.db --compressed http://localhost:8000/snapshot/low
 sqlite3 low.db 'SELECT COUNT(*) FROM arb_opportunities;'
 
-# SSE stream (Ctrl-C to stop)
+# SSE stream — per-bucket (legacy)
 curl -N http://localhost:8000/stream/low
 ```
 
@@ -207,19 +232,26 @@ The `data` column holds a JSON object with all event-specific fields
 ## Key design decisions
 
 ### Atomic ingest swap
-Body is streamed to `arbitrage.db.incoming`, fsync'd, then
-`os.replace()`'d to `arbitrage.db`. A single `asyncio.Lock` serialises
-concurrent pushes so the reconciler always sees a complete file.
+Body is streamed to `*.db.incoming`, fsync'd, then `os.replace()`'d to
+`*.db`. A single `asyncio.Lock` serialises concurrent pushes so the
+reconciler always sees a complete file.
 
-### Dedup key
+### Matches mode (default) — snapshot refresh
+The backend does NOT compute row-level deltas for `matches.db`.  It
+stores the file and broadcasts a ``refresh`` event on the matches SSE
+stream.  Clients react by re-fetching `/snapshot/matches`.  This keeps
+the backend stateless and fast — the arbitrage scanner runs in the
+browser/extension.
+
+### Legacy mode — dedup + bucket partition
 `(group_id, sorted(bookmakers_across_all_legs))` — when the ETL produces
 two rows for the same fixture on the same bookmaker set, only the highest
 `profit_margin_bps` row is forwarded to clients.
 
 ### 409 on duplicate scanner run-id
-`X-Scanner-Run-Id` is a monotone push counter. If a retry arrives with
-`run_id ≤ last_applied_run_id`, the backend returns 409 immediately
-(inside the asyncio.Lock) without touching the filesystem.
+`X-Scanner-Run-Id` is a monotone push counter (legacy only). If a retry
+arrives with `run_id ≤ last_applied_run_id`, the backend returns 409
+immediately (inside the asyncio.Lock) without touching the filesystem.
 
 ### SSE ring buffer
 Default 1024 events per bucket. Reconnecting clients with
@@ -269,8 +301,11 @@ app/
   api/
     health.py          /health
     ingest.py          PUT /ingest/arbitrage
+    matches_ingest.py  PUT /ingest/matches
     snapshot.py        GET /snapshot/{bucket}
+    matches_snapshot.py GET /snapshot/matches
     stream.py          GET /stream/{bucket}
+    matches_stream.py  GET /stream/matches
     arbs.py            GET /arbs/{bucket}, /meta, /buckets, /metrics
 tests/
   conftest.py          _isolated_state, build_arbitrage_db, app_with_state

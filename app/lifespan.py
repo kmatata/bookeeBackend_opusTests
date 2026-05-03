@@ -23,9 +23,15 @@ async def lifespan(app: FastAPI):
         bucket_names=list(s.buckets.keys()),
         ring_size=s.sse_ring_buffer_size,
     )
+    # Broadcaster for the matches snapshot refresh stream (client-side arb).
+    app.state.matches_broadcaster = Broadcaster(
+        bucket_names=["matches"],
+        ring_size=s.sse_ring_buffer_size,
+    )
     app.state.snapshot_cache = SnapshotCache(
         ttl_seconds=float(s.snapshot_cache_seconds),
     )
     # Monotone counter: ingest handler rejects any X-Scanner-Run-Id ≤ this.
     app.state.last_scanner_run_id = 0
+    app.state.last_matches_received_at = None
     yield
